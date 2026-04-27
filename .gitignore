@@ -13,3 +13,7 @@ venv/
 plans/
 stores/
 traces/
+
+# Calibration outputs
+calibration/
+/tmp/

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "substrate"
@@ -9,8 +9,15 @@ description = "MLX-native compiler/runtime for oversized local models under hard
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+calibration = [
+    "mlx>=0.20",
+    "mlx-lm>=0.19",
+]
+
 [project.scripts]
 substrate = "substrate.cli:main"
+substrate-calibrate = "scripts.calibrate:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
