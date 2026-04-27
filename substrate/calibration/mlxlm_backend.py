@@ -2,38 +2,39 @@
 substrate.calibration.mlxlm_backend — Real backend using mlx-lm.
 
 Implements CalibrationBackend against an mlx-lm model. Captures per-op
-activations via forward hooks, and ablates ops via mx.quantize round-trip
-in a context manager that restores weights even on exception.
+activations via layer-wrapper substitution, and ablates ops via mx.quantize
+round-trip in a context manager that restores weights even on exception.
 
 This module imports mlx and mlx_lm at module level. It is only loaded when
 the user actually invokes calibration; the calibration package's __init__
 does NOT import it. Substrate's planner-only path stays MLX-free.
 
-Architectural notes:
+Why we wrap layers instead of monkey-patching __call__:
+    mlx.nn.Module extends dict and uses __call__ defined on the class.
+    Reassigning instance.__call__ does not affect what `layer(...)` invokes,
+    because Python resolves __call__ via type(instance).__call__. We must
+    replace the layer in its parent's children list — which works because
+    Qwen2Model (and most mlx-lm models) store layers as a plain Python list
+    (`self.layers = [TransformerBlock(...) for _ in range(N)]`).
 
-    Op discovery walks the model tree and identifies attention / mlp blocks
-    by class name. We collapse fine-grained sub-modules (q_proj, k_proj, etc.)
-    into single coarse ops ('attention', 'mlp_dense') matching Substrate's
-    OpKind taxonomy. The ablation context manager quantizes ALL sub-modules
-    of the coarse op simultaneously, so 'ablate attention at 4 bits' means
-    'quantize q_proj, k_proj, v_proj, o_proj all at 4 bits'.
+Coarse taxonomy in v0.1:
+    We measure the layer's residual-stream output as the activation for
+    BOTH the attention and mlp_dense slots in that layer. This is a
+    deliberate granularity tradeoff — sub-module captures (q/k/v/o_proj,
+    gate/up/down) require deeper instrumentation and don't pay off for
+    the planner, which currently treats both attention sub-modules
+    identically. v0.2 can split them.
 
-    Activation capture is via mlx-lm's hidden_states output if available,
-    otherwise via direct module hooks. v0.1 uses hidden_states for the
-    residual stream after each block, which is what matters for downstream
-    behavior. Per-sub-module captures (e.g. attn output before residual)
-    are V2 — they require deeper instrumentation.
-
-    Because we use the residual-stream output as the "activation" for both
-    'attention' and 'mlp_dense' in the same layer, divergence will overlap
-    somewhat between those two ops. This is acceptable for v0.1: the
-    estimator only needs relative ordering across precisions, not absolute
-    isolation per sub-op. V2 can split them.
+Why we use mlx.quantize/dequantize for ablation:
+    The point of calibration is to measure how much quality degrades when
+    weights are stored at lower precision. mx.quantize(W, bits=N) produces
+    the lossy quantized representation; mx.dequantize reconstructs the
+    "lower-precision-equivalent" floating-point weights. Running the model
+    with these reconstructed weights gives us the divergence signal we need.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -50,8 +51,6 @@ log = logging.getLogger(__name__)
 
 
 # Lazy imports: don't fail at import time if MLX isn't installed.
-# The backend is only instantiated when the user invokes calibration with
-# --backend mlx-lm, so an ImportError here is correct.
 def _import_mlx():
     try:
         import mlx.core as mx
@@ -73,27 +72,76 @@ def _import_mlx():
 class _MLXCapture:
     """
     Wraps an mlx.core.array. flatten() converts to Python floats lazily.
-
-    We store the array, not the flattened sequence, because the runner often
-    wants to compute multiple metrics over the same capture. Flattening on
-    every metric call would be wasteful.
+    Storing the array (not the flattened sequence) lets the runner compute
+    multiple metrics over the same capture without re-converting.
     """
     array: object               # mx.array; typed as object to avoid MLX import
     _shape_tuple: tuple[int, ...]
 
     def flatten(self) -> Sequence[float]:
-        # Convert MLX array -> Python list of floats via numpy.
-        # mx.array supports .tolist() in recent mlx-lm versions; fall back
-        # to numpy conversion otherwise.
+        # Force evaluation, then convert to Python floats via tolist().
+        # mx arrays are lazy by default; tolist() is the canonical way to
+        # materialize them as host data in mlx 0.31+.
         try:
-            flat = self.array.flatten().tolist()
-            return tuple(float(v) for v in flat)
-        except AttributeError:
+            return tuple(float(v) for v in self.array.flatten().tolist())
+        except (AttributeError, TypeError):
+            # Fallback via numpy. Never expected on mlx 0.20+, but defensive
+            # in case the captured object isn't an mx.array (tests).
             import numpy as np
             return tuple(float(v) for v in np.array(self.array).flatten())
 
     def shape(self) -> tuple[int, ...]:
         return self._shape_tuple
+
+
+# ---------------------------------------------------------------------------
+# Layer wrapper used to capture residual-stream activations.
+#
+# The wrapper is constructed once per backend and installed/removed via the
+# _record_layer_outputs context manager. It captures into a shared dict
+# keyed by layer_id, which the backend's capture_reference reads after the
+# forward pass completes.
+# ---------------------------------------------------------------------------
+def _make_recording_wrapper_class(nn_module_cls):
+    """
+    Build a Module subclass that delegates to a wrapped layer and records
+    its output. Built lazily inside _import_mlx() so we don't import mlx.nn
+    at module load time.
+
+    We can't define this as a top-level class because it must inherit from
+    mlx.nn.Module, which is unavailable until the user opts into MLX.
+    """
+
+    class _RecordingLayerWrapper(nn_module_cls):
+        def __init__(self, wrapped, layer_id, capture_dict):
+            super().__init__()
+            # Stash the wrapped layer as an attribute. mlx.nn.Module.__setattr__
+            # handles both Module children and arbitrary attributes; assigning
+            # a Module here makes it part of the parameter tree (which we
+            # don't want to disturb but is harmless during a single forward).
+            self.wrapped = wrapped
+            self._layer_id = layer_id
+            self._capture_dict = capture_dict
+
+        def __call__(self, *args, **kwargs):
+            output = self.wrapped(*args, **kwargs)
+            # Layer outputs in mlx-lm transformer blocks are usually just
+            # the hidden state tensor (shape [batch, seq, hidden]). Some
+            # variants return (hidden, cache); handle both.
+            hidden = output[0] if isinstance(output, tuple) else output
+            # Mean-pool over sequence to get a representative summary vector.
+            # Calibration cares about per-layer behavior, not per-token.
+            pooled = hidden.mean(axis=1).flatten()
+            shape = tuple(int(d) for d in pooled.shape)
+            capture = _MLXCapture(array=pooled, _shape_tuple=shape)
+            # We populate every coarse op_kind slot for this layer; the
+            # backend filters by valid op_ids before returning.
+            self._capture_dict[f"layer_{self._layer_id}.attention"] = capture
+            self._capture_dict[f"layer_{self._layer_id}.mlp_dense"] = capture
+            self._capture_dict[f"layer_{self._layer_id}.moe_dispatch"] = capture
+            return output
+
+    return _RecordingLayerWrapper
 
 
 # ---------------------------------------------------------------------------
@@ -103,10 +151,10 @@ class MLXLMBackend:
     """
     Calibration backend backed by mlx-lm.
 
-    Construct with a HuggingFace model id (e.g. 'mlx-community/Qwen2.5-1.5B-Instruct').
-    Models that are already quantized in the snapshot WILL NOT be useful for
-    calibration — we need FP16/BF16 weights to ablate from. Use the FP variant
-    of any quantized model on the Hub.
+    Construct with a HuggingFace model id (e.g. 'mlx-community/Qwen2.5-1.5B-Instruct-bf16').
+    Models that are already quantized in the snapshot (e.g. -4bit variants)
+    WILL NOT be useful for calibration — we need FP16/BF16 weights to ablate
+    from. Use the FP variant of any quantized model on the Hub.
     """
 
     def __init__(self, model_id: str) -> None:
@@ -114,16 +162,19 @@ class MLXLMBackend:
         self._model_id_str = model_id
 
         log.info("Loading model %s via mlx-lm...", model_id)
-        # mlx_lm.load returns (model, tokenizer). For some versions it returns
-        # a config dict as well; handle both shapes.
         loaded = self._load(model_id)
+        # mlx_lm.load returns (model, tokenizer) in current versions; older
+        # versions returned (model, tokenizer, config). Handle both.
         if len(loaded) == 2:
             self._model, self._tokenizer = loaded
         else:
             self._model, self._tokenizer = loaded[0], loaded[1]
 
-        self._layers = self._discover_layers()
+        self._layers_parent, self._layers_attr = self._discover_layer_container()
+        self._layers: list = list(getattr(self._layers_parent, self._layers_attr))
         log.info("Loaded %s with %d layers", model_id, len(self._layers))
+
+        self._wrapper_cls = _make_recording_wrapper_class(self._nn.Module)
 
     @property
     def name(self) -> str:
@@ -144,44 +195,45 @@ class MLXLMBackend:
     # ------------------------------------------------------------------
     # Op discovery.
     # ------------------------------------------------------------------
-    def _discover_layers(self) -> list[object]:
+    def _discover_layer_container(self) -> tuple[object, str]:
         """
-        Walk the model tree and find the transformer block list.
+        Find the parent module and attribute name that holds the transformer
+        block list. We need the parent because layer swapping happens via
+        `setattr(parent, attr, new_list)`, not through the layer itself.
 
-        Different mlx-lm models put the layers in different attributes:
-            - Llama/Qwen: model.model.layers
-            - Some MoE models: model.model.layers (same, but with MoE inside)
-
-        We try a list of common paths and use the first one that resolves.
+        Returns (parent, attribute_name). E.g. for Qwen2Model, returns
+        (model.model, 'layers').
         """
         candidates = [
-            ("model", "layers"),                      # Most mlx-lm models
-            ("model", "model", "layers"),             # Some wrappers
-            ("transformer", "h"),                     # GPT-2-style
-            ("layers",),                              # Bare model
+            (("model",), "layers"),
+            (("model", "model"), "layers"),
+            (("transformer",), "h"),
+            ((), "layers"),
         ]
-        for path in candidates:
-            obj = self._model
+        for path, attr in candidates:
+            parent = self._model
             ok = True
-            for attr in path:
-                if not hasattr(obj, attr):
+            for step in path:
+                if not hasattr(parent, step):
                     ok = False
                     break
-                obj = getattr(obj, attr)
-            if ok and isinstance(obj, (list, tuple)) and len(obj) > 0:
-                return list(obj)
+                parent = getattr(parent, step)
+            if not ok:
+                continue
+            value = getattr(parent, attr, None)
+            if isinstance(value, (list, tuple)) and len(value) > 0:
+                return parent, attr
         raise RuntimeError(
-            f"Could not locate transformer layer list in model {self._model_id_str}. "
-            f"Tried: {candidates}. Inspect model structure and update _discover_layers."
+            f"Could not locate transformer layer list in model "
+            f"{self._model_id_str}. Inspect model structure and update "
+            f"_discover_layer_container."
         )
 
     def discover_ops(self) -> tuple[OpDescriptor, ...]:
         """
         For each layer, identify the attention block and the MLP block,
-        then report one OpDescriptor each.
-
-        Param counts are summed across all sub-modules of the coarse op.
-        We use mlx's parameter tree for this.
+        then report one OpDescriptor each. Param counts are summed across
+        all sub-modules of the coarse op.
         """
         ops: list[OpDescriptor] = []
         for layer_id, layer in enumerate(self._layers):
@@ -196,7 +248,6 @@ class MLXLMBackend:
                     param_count=self._count_params(attn),
                 ))
             if mlp is not None:
-                # Detect MoE vs dense by structure: MoE has an experts list.
                 if self._is_moe(mlp):
                     ops.append(OpDescriptor(
                         op_id=f"layer_{layer_id}.moe_dispatch",
@@ -223,7 +274,6 @@ class MLXLMBackend:
 
     @staticmethod
     def _is_moe(mlp: object) -> bool:
-        # Heuristic: MoE blocks have an 'experts' attribute that is a list.
         experts = getattr(mlp, "experts", None)
         if experts is None:
             return False
@@ -233,19 +283,12 @@ class MLXLMBackend:
             return False
 
     def _count_params(self, module: object) -> int:
-        """
-        Sum the parameter counts of a module's leaf weights.
-
-        Walks .parameters() if available; otherwise iterates submodules.
-        """
         try:
             params = module.parameters()
         except AttributeError:
             return 0
         total = 0
-        # mlx nn.Module.parameters() returns a tree; flatten it.
-        flat = self._flatten_param_tree(params)
-        for arr in flat:
+        for arr in self._flatten_param_tree(params):
             shape = getattr(arr, "shape", None)
             if shape is None:
                 continue
@@ -257,7 +300,6 @@ class MLXLMBackend:
 
     @classmethod
     def _flatten_param_tree(cls, tree: object) -> list[object]:
-        """Recursively flatten dict/list parameter trees into a list of arrays."""
         out: list[object] = []
         if isinstance(tree, dict):
             for v in tree.values():
@@ -266,7 +308,6 @@ class MLXLMBackend:
             for v in tree:
                 out.extend(cls._flatten_param_tree(v))
         else:
-            # Leaf — assume it's an mx.array.
             out.append(tree)
         return out
 
@@ -276,15 +317,7 @@ class MLXLMBackend:
     def encode_corpus(
         self, text: str, max_sequences: int, sequence_length: int,
     ) -> tuple[Sequence[int], ...]:
-        """
-        Tokenize the entire text once, then chunk into sequences.
-
-        We don't use the tokenizer's add_special_tokens here — calibration
-        cares about typical activation behavior on raw text, not chat
-        templates. The user can put whatever they want in the corpus file.
-        """
         all_tokens = self._tokenizer.encode(text)
-        # Some tokenizers return lists of ints; some return tensors. Normalize.
         if hasattr(all_tokens, "tolist"):
             all_tokens = all_tokens.tolist()
 
@@ -293,8 +326,6 @@ class MLXLMBackend:
         while cursor < len(all_tokens) and len(sequences) < max_sequences:
             chunk = all_tokens[cursor:cursor + sequence_length]
             if len(chunk) < 8:
-                # Skip degenerate tail chunks; activations from very short
-                # sequences are noise.
                 break
             sequences.append(tuple(int(t) for t in chunk))
             cursor += sequence_length
@@ -309,82 +340,63 @@ class MLXLMBackend:
         """
         Run the FP forward pass, return per-op activations.
 
-        v0.1 uses the residual stream after each transformer block as the
-        activation for both attention and mlp_dense in that block. This is
-        a coarse measurement — V2 should hook q/k/v/o_proj outputs and mlp
-        sub-modules separately.
+        Implementation: temporarily replace each layer in model.model.layers
+        with a _RecordingLayerWrapper that captures the layer's output, then
+        run a forward pass. Wrappers are removed on exit (always — try/finally).
         """
-        mx = self._mx
-        tokens = mx.array([list(sequence)])
-        # Run model forward to get hidden states. mlx-lm models accept tokens
-        # and return logits, but we want intermediate states. We monkeypatch
-        # the layers to record their outputs, then restore.
         captures: dict[str, ActivationCapture] = {}
-        original_calls: list[tuple[object, object]] = []
-
-        def make_recording_call(layer_id: int, original_call):
-            def recording_call(*args, **kwargs):
-                output = original_call(*args, **kwargs)
-                # Layers return either a tensor or a (tensor, cache) tuple.
-                hidden = output[0] if isinstance(output, tuple) else output
-                # Mean-pool over sequence length to get one vector per layer.
-                # We do this because activations are huge (seq_len x hidden)
-                # and we just need a representative summary for divergence.
-                pooled = hidden.mean(axis=1).flatten()
-                shape = tuple(int(d) for d in pooled.shape)
-                captures[f"layer_{layer_id}.attention"] = _MLXCapture(
-                    array=pooled, _shape_tuple=shape,
-                )
-                # We use the same residual-stream pool for the MLP slot,
-                # acknowledging the coarse-granularity tradeoff documented
-                # at the top of this file.
-                captures[f"layer_{layer_id}.mlp_dense"] = _MLXCapture(
-                    array=pooled, _shape_tuple=shape,
-                )
-                captures[f"layer_{layer_id}.moe_dispatch"] = _MLXCapture(
-                    array=pooled, _shape_tuple=shape,
-                )
-                return output
-            return recording_call
-
-        # Install hooks via __call__ replacement.
-        for layer_id, layer in enumerate(self._layers):
-            original = layer.__call__
-            original_calls.append((layer, original))
-            # Bind through a closure to capture layer_id correctly.
-            layer.__call__ = make_recording_call(layer_id, original)
-
-        try:
+        with self._record_layer_outputs(captures):
+            tokens = self._mx.array([list(sequence)])
             _ = self._model(tokens)
-        finally:
-            # Always restore.
-            for layer, original in original_calls:
-                layer.__call__ = original
+            # Force evaluation. mx is lazy; if we don't eval the result, the
+            # captured pooled tensors are unrealized and tolist() in flatten()
+            # will trigger evaluation outside the timing window — fine for
+            # correctness, but better to eval here for predictability.
+            self._mx.eval(*[c.array for c in captures.values()])
 
-        # Filter out captures for op_ids that don't exist in this model
-        # (e.g. moe_dispatch entries on a dense model).
+        # Filter to only valid op_ids (e.g. drop moe_dispatch entries on a
+        # dense model).
         valid_op_ids = {op.op_id for op in self.discover_ops()}
         return {oid: cap for oid, cap in captures.items() if oid in valid_op_ids}
+
+    @contextmanager
+    def _record_layer_outputs(self, capture_dict: dict) -> Iterator[None]:
+        """
+        Replace each layer in the parent's `layers` attribute with a wrapper
+        that records its output. Restore the original list on exit.
+
+        The wrappers populate `capture_dict` as a side effect of __call__.
+        """
+        original = list(getattr(self._layers_parent, self._layers_attr))
+        wrapped = [
+            self._wrapper_cls(layer, layer_id, capture_dict)
+            for layer_id, layer in enumerate(original)
+        ]
+        # Update both the parent's attribute AND our own _layers cache. The
+        # parent's attribute is what the model's forward pass walks; our
+        # cache is what discover_ops uses (which reads underlying layers, so
+        # we point it at originals during the swap to avoid confusion).
+        setattr(self._layers_parent, self._layers_attr, wrapped)
+        try:
+            yield
+        finally:
+            setattr(self._layers_parent, self._layers_attr, original)
 
     def ablate_op(
         self, sequence: Sequence[int], ablation: OpAblation,
     ) -> ActivationCapture:
-        """
-        Run the forward pass with one op quantized, return its activation.
-        """
         validate_bits(ablation.precision_bits)
         with self._temporarily_quantize(ablation.op_id, ablation.precision_bits):
             captures = self.capture_reference(sequence)
         return captures[ablation.op_id]
 
     def close(self) -> None:
-        # mlx-lm doesn't expose a model.close(); we let GC handle it.
         self._model = None
 
     # ------------------------------------------------------------------
     # Quantization helper. Save weights, quantize-then-dequantize in place,
-    # restore on exit. The MLX quantize round-trip is what produces the
-    # "lower-precision-equivalent" weights we ablate against.
+    # restore on exit. Uses mx.quantize/dequantize for the precision
+    # round-trip.
     # ------------------------------------------------------------------
     @contextmanager
     def _temporarily_quantize(self, op_id: str, bits: int) -> Iterator[None]:
@@ -398,19 +410,16 @@ class MLXLMBackend:
                 f"kind {op_kind}) in model {self._model_id_str}"
             )
 
-        # Snapshot all weight arrays in the target module's subtree.
-        # We collect (parent_module, attribute_name, original_array) tuples
-        # so we can restore by attribute assignment.
+        # Snapshot weight arrays in the target subtree.
         snapshots: list[tuple[object, str, object]] = []
         self._snapshot_weights(target_module, snapshots)
+        if not snapshots:
+            log.warning("op %s: no weight arrays found to ablate", op_id)
 
         try:
-            # Apply quantize-then-dequantize round-trip. Group size of 64 is
-            # the mlx default for affine quantization.
             for parent, attr, original in snapshots:
                 if original.ndim < 2 or min(original.shape) < 64:
                     # mx.quantize requires 2D+ arrays with last dim >= group_size.
-                    # Skip 1D biases and small tensors.
                     continue
                 quantized, scales, biases = mx.quantize(
                     original, group_size=64, bits=bits,
@@ -421,17 +430,14 @@ class MLXLMBackend:
                 setattr(parent, attr, dequantized)
             yield
         finally:
-            # Always restore originals.
             for parent, attr, original in snapshots:
                 setattr(parent, attr, original)
 
     @staticmethod
     def _parse_op_id(op_id: str) -> tuple[int, str]:
-        # Format: "layer_{N}.{op_kind}"
         try:
             layer_part, kind = op_id.split(".", 1)
-            layer_id = int(layer_part[len("layer_"):])
-            return layer_id, kind
+            return int(layer_part[len("layer_"):]), kind
         except (ValueError, IndexError):
             raise ValueError(f"Malformed op_id: {op_id!r}")
 
@@ -448,24 +454,27 @@ class MLXLMBackend:
     ) -> None:
         """
         Walk a module's children and collect (parent, attr, array) for every
-        weight array. We do this manually rather than via .parameters() so we
-        can restore by setattr later.
+        weight array. This is more reliable than module.parameters() because
+        we need stable references for setattr-based restoration.
+
+        mlx.nn.Module is dict-based, so we iterate via its dict keys.
         """
-        for attr in dir(module):
-            if attr.startswith("_"):
-                continue
-            try:
-                value = getattr(module, attr)
-            except AttributeError:
-                continue
-            # Identify mx.array by checking for .shape and .dtype on the
-            # value. Avoids hard-coupling to a specific MLX API surface.
+        # mlx.nn.Module extends dict. Iterate via items() to get (name, child)
+        # pairs without including private/method attributes.
+        try:
+            items = module.items() if hasattr(module, "items") else []
+        except Exception:
+            items = []
+
+        for attr, value in items:
+            # Leaf array: weight or bias.
             if hasattr(value, "shape") and hasattr(value, "dtype") and not callable(value):
                 out.append((module, attr, value))
-            elif hasattr(value, "parameters"):
-                # Recurse into submodules.
+            # Submodule: recurse.
+            elif hasattr(value, "items") and callable(getattr(value, "items", None)):
                 cls._snapshot_weights(value, out)
+            # List of submodules (e.g. MoE experts).
             elif isinstance(value, (list, tuple)):
-                for i, item in enumerate(value):
-                    if hasattr(item, "parameters"):
+                for item in value:
+                    if hasattr(item, "items") and callable(getattr(item, "items", None)):
                         cls._snapshot_weights(item, out)

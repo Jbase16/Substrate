@@ -178,19 +178,21 @@ class Planner:
     def compile(self, profile: ModelProfile, budget: Budget) -> PlanBundle:
         notes: list[str] = []
 
-        # 1. Feasibility.
-        report = check_feasibility(profile, budget)
+        # 1. Resolve the quality estimator FIRST. Feasibility's quality-axis
+        #    check needs it to compute the realistic ceiling; without it,
+        #    feasibility falls back to a hardcoded surrogate that disagrees
+        #    with the planner's post-fill check. Resolving here keeps both
+        #    grounded in the same data.
+        estimator, grounding = self._resolve_estimator(profile, notes)
+
+        # 2. Feasibility — now estimator-aware.
+        report = check_feasibility(profile, budget, quality_estimator=estimator)
         if not report.feasible:
             raise InfeasibleBudgetError(report)
         notes.append(
-            f"feasibility ok: floor_ram={report.floor_resident_bytes / 1e9:.2f}GB"
+            f"feasibility ok: floor_ram={report.floor_resident_bytes / 1e9:.2f}GB "
+            f"ceiling_quality={report.ceiling_quality_loss:.6f} ({grounding})"
         )
-
-        # 2. Resolve the quality estimator. If the user didn't provide one,
-        #    build a stub table and feed it into HybridQualityEstimator. This
-        #    keeps a single quality code path; the only difference between
-        #    "real calibration" and "stub" is the table contents.
-        estimator, grounding = self._resolve_estimator(profile, notes)
 
         # 3. Greedy RDO precision assignment for tier 0.
         tier0_precision = self._greedy_quality_fill(

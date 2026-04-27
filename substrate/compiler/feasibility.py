@@ -1,9 +1,36 @@
+"""
+substrate.compiler.feasibility — Pre-flight feasibility checks.
+
+Four binding axes, evaluated in this order:
+
+    MEMORY    — Even the skeleton-only configuration exceeds the RAM budget.
+    BANDWIDTH — SSD throughput cannot serve the residual stream in real time.
+    LATENCY   — Best-case op latency sums above the target tokens-per-second.
+    QUALITY   — Even at maximum precision, predicted loss exceeds the cap.
+
+The check is grounded in the profile metadata and (for the QUALITY axis)
+optionally in a real QualityEstimator. Without an estimator, the QUALITY
+check uses the profile's per-op `best_quality_loss` surrogate as the
+ceiling, which is conservative but unrealistic. With an estimator, the
+ceiling is computed by querying the estimator at all-NEAR_FP16 — the same
+ceiling the planner's post-fill check would discover.
+
+Calling check_feasibility from the planner ensures both pre-flight and
+post-fill quality checks agree (they query the same estimator). Calling
+it from the CLI without an estimator (`feasibility` subcommand) gives a
+quick conservative answer without requiring a calibration file.
+"""
+
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
-    from substrate.compiler.planner import Budget, ModelProfile, OpProfile
+    from substrate.compiler.planner import Budget, ModelProfile
+    from substrate.compiler.quality import QualityEstimator
+
 
 class BindingAxis(str, Enum):
     NONE = "none"
@@ -11,6 +38,7 @@ class BindingAxis(str, Enum):
     BANDWIDTH = "bandwidth"
     LATENCY = "latency"
     QUALITY = "quality"
+
 
 @dataclass(frozen=True)
 class FeasibilityReport:
@@ -37,12 +65,29 @@ class FeasibilityReport:
             },
         }
 
+
 class InfeasibleBudgetError(Exception):
     def __init__(self, report: FeasibilityReport):
         self.report = report
         super().__init__(report.reason)
 
-def check_feasibility(profile, budget) -> FeasibilityReport:
+
+def check_feasibility(
+    profile: "ModelProfile",
+    budget: "Budget",
+    quality_estimator: "QualityEstimator | None" = None,
+) -> FeasibilityReport:
+    """
+    Run all four feasibility axes. Returns a FeasibilityReport.
+
+    The optional quality_estimator is queried at all-NEAR_FP16 to compute
+    the realistic quality ceiling. Without it, the check falls back to
+    `sum(op.best_quality_loss for op in profile.ops)` — a surrogate that
+    is conservative but disconnected from real measurement. Always pass
+    the estimator when one is available; the surrogate is for tests and
+    quick CLI feasibility checks against profiles alone.
+    """
+    # MEMORY axis.
     floor_ram = (
         profile.embedding_bytes
         + profile.lm_head_bytes
@@ -67,6 +112,7 @@ def check_feasibility(profile, budget) -> FeasibilityReport:
             floor_resident_bytes=floor_ram,
         )
 
+    # BANDWIDTH axis.
     residual_bytes_per_token = sum(
         op.minimum_residual_bytes_per_token for op in profile.ops
     )
@@ -95,6 +141,7 @@ def check_feasibility(profile, budget) -> FeasibilityReport:
             floor_ssd_bandwidth_bps=required_bandwidth_bps,
         )
 
+    # LATENCY axis.
     floor_compute_us = sum(op.skeleton_compute_us for op in profile.ops)
     if budget.target_tokens_per_second is not None:
         target_us = int(1e6 / budget.target_tokens_per_second)
@@ -115,14 +162,17 @@ def check_feasibility(profile, budget) -> FeasibilityReport:
                 floor_compute_us_per_token=floor_compute_us,
             )
 
-    ceiling_quality = sum(op.best_quality_loss for op in profile.ops)
+    # QUALITY axis. Use the estimator if provided; otherwise the surrogate.
+    ceiling_quality = _compute_quality_ceiling(profile, quality_estimator)
     if ceiling_quality > budget.quality_loss_cap:
+        ceiling_source = "calibrated" if quality_estimator is not None else "surrogate"
         return FeasibilityReport(
             feasible=False,
             binding_axis=BindingAxis.QUALITY,
             reason=(
-                f"Even at maximum precision, quality loss ({ceiling_quality:.4f}) "
-                f"exceeds the cap ({budget.quality_loss_cap:.4f})."
+                f"Even at maximum precision, predicted quality loss "
+                f"({ceiling_quality:.4f}, {ceiling_source}) exceeds the cap "
+                f"({budget.quality_loss_cap:.4f})."
             ),
             relax_options={
                 "quality_loss_cap": f">= {ceiling_quality:.4f}",
@@ -141,3 +191,31 @@ def check_feasibility(profile, budget) -> FeasibilityReport:
         floor_compute_us_per_token=floor_compute_us,
         ceiling_quality_loss=ceiling_quality,
     )
+
+
+def _compute_quality_ceiling(
+    profile: "ModelProfile",
+    estimator: "QualityEstimator | None",
+) -> float:
+    """
+    Compute the realistic best-case quality loss.
+
+    With an estimator: query at all-NEAR_FP16. This is what the planner's
+    post-fill check uses, so feasibility and the planner agree on the
+    ceiling. The estimator's clamped expected_loss is the answer.
+
+    Without an estimator: fall back to the profile's surrogate
+    sum(op.best_quality_loss). Conservative but disconnected from real
+    measurement.
+    """
+    if estimator is None:
+        return sum(op.best_quality_loss for op in profile.ops)
+
+    # Build all-NEAR_FP16 assignment. Import locally to avoid a top-level
+    # circular import (planner imports feasibility).
+    from substrate.compiler.planner import Precision
+
+    assignment = {
+        (op.layer_id, op.op_kind): Precision.NEAR_FP16 for op in profile.ops
+    }
+    return estimator.estimate(assignment).expected_loss
