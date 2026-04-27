@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "substrate"
+version = "0.1.0"
+description = "MLX-native compiler/runtime for oversized local models under hard memory constraints"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+substrate = "substrate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["substrate*"]
