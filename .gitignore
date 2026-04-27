@@ -14,6 +14,6 @@ plans/
 stores/
 traces/
 
-# Calibration outputs
-calibration/
+# Calibration outputs (top-level directory only, not the substrate/calibration package)
+/calibration/
 /tmp/
