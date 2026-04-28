@@ -42,6 +42,7 @@ from substrate.calibration.metrics import (
     aggregate_losses,
     get_metric,
 )
+from substrate.calibration.activation_dump import ActivationDump
 from substrate.calibration.schema import (
     CalibrationCell,
     CalibrationOutput,
@@ -126,10 +127,16 @@ class CalibrationRunner:
         self,
         backend: CalibrationBackend,
         options: RunnerOptions | None = None,
+        activation_dump: ActivationDump | None = None,
     ) -> None:
         self.backend = backend
         self.options = options or RunnerOptions()
         self._metric: DivergenceMetric = get_metric(self.options.metric_name)
+        # Optional sink for paired activations. When provided, the runner
+        # records FP and ablated vectors per (op, sequence, precision) so
+        # downstream probe training has real data to learn from. None is
+        # the default; the activation dump is opt-in via CLI flag.
+        self._activation_dump = activation_dump
 
     def run(self, corpus_text: str, corpus_path: str | Path) -> CalibrationOutput:
         started_at = time.time()
@@ -148,6 +155,14 @@ class CalibrationRunner:
             len(ops), len(self.options.precisions),
             len(ops) * len(self.options.precisions),
         )
+
+        # Pre-register every op on the dump so write() emits accumulators
+        # in deterministic order. Skipped if no dump was provided.
+        if self._activation_dump is not None:
+            for op in ops:
+                self._activation_dump.register_op(
+                    op.op_id, op.layer_id, op.op_kind,
+                )
 
         # Build accumulators: one per (layer, op_kind, precision) cell.
         accumulators: dict[tuple[int, str, int], _CellAccumulator] = {}
@@ -236,6 +251,15 @@ class CalibrationRunner:
                 continue
             ref_flat = ref.flatten()
 
+            # Record the FP reference for this op + sequence.
+            # Critical alignment invariant: this happens BEFORE any
+            # precision is recorded for this op-sequence pair, so row N
+            # of fp16.npy and row N of bits_<P>.npy are the same sequence.
+            if self._activation_dump is not None:
+                self._activation_dump.record_fp(
+                    op.op_id, op.layer_id, op.op_kind, ref_flat,
+                )
+
             for bits in self.options.precisions:
                 ablation = OpAblation(
                     op_id=op.op_id,
@@ -261,3 +285,9 @@ class CalibrationRunner:
                     )
                     continue
                 accumulators[(op.layer_id, op.op_kind, bits)].add(loss)
+                # Record the ablated vector. Pairs with the FP reference
+                # recorded above by row index.
+                if self._activation_dump is not None:
+                    self._activation_dump.record_precision(
+                        op.op_id, op.layer_id, op.op_kind, bits, cand_flat,
+                    )

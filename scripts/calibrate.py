@@ -96,6 +96,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated layer ids treated as sensitive in synthetic backend.",
     )
     p.add_argument(
+        "--save-activations", action="store_true",
+        help=(
+            "Dump paired (FP16, ablated) pooled activations per (op, sequence, "
+            "precision) to {run_dir}/activations/. Required for probe training. "
+            "Adds ~50 MB per Qwen2.5-1.5B-class run; off by default."
+        ),
+    )
+    p.add_argument(
         "--verbose", "-v", action="store_true",
         help="DEBUG logging.",
     )
@@ -152,9 +160,20 @@ def main(argv: list[str] | None = None) -> int:
         sequence_length=args.sequence_length,
     )
 
+    # Optional activation dump. Constructed before the run so the runner
+    # can record into it; written after the run so the on-disk layout
+    # sits next to calibration.json.
+    activation_dump = None
+    if args.save_activations:
+        from substrate.calibration.activation_dump import ActivationDump
+        activation_dump = ActivationDump()
+
     backend = _make_backend(args)
     try:
-        runner = CalibrationRunner(backend=backend, options=options)
+        runner = CalibrationRunner(
+            backend=backend, options=options,
+            activation_dump=activation_dump,
+        )
         output = runner.run(corpus_text=corpus_text, corpus_path=corpus_path.resolve())
     finally:
         backend.close()
@@ -162,9 +181,22 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = make_run_dir(args.output_root, output.config.model_id)
     paths = write_calibration_run(output, run_dir)
 
+    # Materialize the activation dump alongside calibration.json. Returns
+    # a summary with byte counts and per-op samples; we print it so the
+    # operator can verify what landed on disk.
+    activation_summary = None
+    if activation_dump is not None:
+        activation_summary = activation_dump.write(run_dir)
+
     print(f"\nCalibration written to: {run_dir}")
     for name, path in paths.items():
         print(f"  {name}: {path}")
+    if activation_summary is not None:
+        print(
+            f"  activations: {len(activation_summary['ops'])} ops, "
+            f"{activation_summary['total_bytes_estimate'] / (1024 * 1024):.1f} MB "
+            f"-> {run_dir}/activations/"
+        )
 
     summary = output.summary()
     print(f"\nSummary:")
