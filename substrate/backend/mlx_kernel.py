@@ -97,7 +97,11 @@ class MLXOpKernel:
     layer-half computation specified by op.op_id.
     """
 
-    def __init__(self, model: object) -> None:
+    def __init__(
+        self,
+        model: object,
+        weight_bank: object | None = None,
+    ) -> None:
         """
         Parameters
         ----------
@@ -105,16 +109,31 @@ class MLXOpKernel:
             An mlx-lm-loaded model (e.g. from `mlx_lm.load()`). For v0.1 must
             be a Qwen2-family model. We discover the layer list during
             construction and fail loudly if the structure is unexpected.
+        weight_bank
+            Optional WeightBank instance. When provided, the kernel calls
+            bank.swap(op.op_id, op.tier_index) before each op execution,
+            so the live MLX module weights match the requested tier. When
+            None, the kernel runs against whatever weights are currently
+            installed (test path / single-precision execution).
+
+            The kernel does NOT construct or own the bank — that is the
+            session/runtime's responsibility. Passing None is correct for:
+                - Test 0 (FP16 split orchestration check)
+                - Test 1 (uniform N-bit applied via in-place quantize)
+                - Any path that wants tier_index ignored.
         """
         self._mx, self._nn = _import_mlx()
         self._model = model
         self._layers = self._discover_layers()
+        self._weight_bank = weight_bank
         # KV caches are lazily initialized on the first attention op of a
         # prompt. Set to None to indicate "not yet initialized this prompt."
         self._caches: list[object] | None = None
 
         log.info(
-            "MLXOpKernel initialized over %d Qwen2 layers", len(self._layers),
+            "MLXOpKernel initialized over %d Qwen2 layers (weight_bank=%s)",
+            len(self._layers),
+            "present" if weight_bank is not None else "none",
         )
 
     # ------------------------------------------------------------------
@@ -131,8 +150,23 @@ class MLXOpKernel:
         session-level (executor decides what to do when a tensor misses its
         deadline; the kernel always assumes its inputs are ready).
 
+        If a WeightBank is attached, the kernel asks the bank to install
+        op.tier_index's weights for op.op_id BEFORE running the layer half.
+        This is the physical lever the TierController eventually drives:
+        change op.tier_index between executions, and the bank installs
+        different weights, and the layer half computes on different bits.
+
+        Without a bank, tier_index is ignored and execution runs against
+        whatever weights are currently installed.
+
         Returns the new hidden state (post-residual).
         """
+        # The control loop. tier_index is the only signal that needs to
+        # propagate: WeightBank.swap is idempotent (no-op when already at
+        # target_tier), so unconditional calling here is cheap.
+        if self._weight_bank is not None:
+            self._weight_bank.swap(op.op_id, op.tier_index)
+
         layer_id = op.layer_id
         if not (0 <= layer_id < len(self._layers)):
             raise IndexError(

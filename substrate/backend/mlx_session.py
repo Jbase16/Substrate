@@ -94,9 +94,14 @@ class MLXForwardSession:
     the executor — not the session's job in v0.1.
     """
 
-    def __init__(self, model: object) -> None:
+    def __init__(
+        self,
+        model: object,
+        weight_bank: object | None = None,
+    ) -> None:
         self._mx = _import_mlx()
         self._model = model
+        self._weight_bank = weight_bank
         # Find embedding, final norm, and lm_head modules. mlx-lm Qwen2
         # layout is: model.model.embed_tokens, model.model.norm, model.lm_head
         # (lm_head may be tied to embed_tokens; mlx-lm handles that).
@@ -111,8 +116,25 @@ class MLXForwardSession:
         """Construct kernel on first access (lazy import)."""
         if self._kernel is None:
             from substrate.backend.mlx_kernel import MLXOpKernel
-            self._kernel = MLXOpKernel(self._model)
+            self._kernel = MLXOpKernel(
+                self._model, weight_bank=self._weight_bank,
+            )
         return self._kernel
+
+    def attach_weight_bank(self, weight_bank: object) -> None:
+        """
+        Attach (or replace) the kernel's weight bank.
+
+        Useful for tests and the runtime where the bank requires the
+        kernel\'s layer list to construct: build session first, build
+        bank from session.kernel._layers, then attach.
+
+        Replacing a bank mid-session is allowed but the caller is
+        responsible for ensuring it doesn\'t mid-flight a forward pass.
+        """
+        self._weight_bank = weight_bank
+        if self._kernel is not None:
+            self._kernel._weight_bank = weight_bank
 
     @property
     def num_layers(self) -> int:
