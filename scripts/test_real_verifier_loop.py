@@ -187,6 +187,8 @@ def run_test_rv1(
     prompt: str,
     threshold: float,
     num_tokens: int,
+    runtime_stats: bool,
+    warmup: int,
     verbose: bool,
 ) -> int:
     mx, mlx_lm = _import_mlx()
@@ -199,6 +201,7 @@ def run_test_rv1(
     print(f"Prompt:   {prompt!r}")
     print(f"Threshold: {threshold}  (controller policy)")
     print(f"Tokens:   {num_tokens}")
+    print(f"Verifier: runtime_stats={runtime_stats}, warmup={warmup}")
     print()
 
     # ------------------------------------------------------------------
@@ -257,8 +260,12 @@ def run_test_rv1(
     # ------------------------------------------------------------------
     print(f"Loading LinearProbeVerifier from {probes_path}...")
     from substrate.runtime.verifier import LinearProbeVerifier
-    verifier = LinearProbeVerifier(probes_path)
-    print(f"  verifier ready")
+    verifier = LinearProbeVerifier(
+        probes_path,
+        runtime_stats=runtime_stats,
+        warmup=warmup,
+    )
+    print(f"  verifier ready  (runtime_stats={runtime_stats}, warmup={warmup})")
     print()
 
     # ------------------------------------------------------------------
@@ -512,6 +519,23 @@ def main(argv: list[str] | None = None) -> int:
         "--num-tokens", type=int, default=4,
         help="Number of forward passes to drive (analogous to tokens generated).",
     )
+    p.add_argument(
+        "--no-runtime-stats", action="store_true",
+        help=(
+            "Disable runtime renormalization; use the saved training-time "
+            "feature_mean/feature_std for normalization. This is the "
+            "naive behavior — only correct when runtime distribution "
+            "matches training distribution."
+        ),
+    )
+    p.add_argument(
+        "--warmup", type=int, default=2,
+        help=(
+            "Number of observations per op to accumulate before freezing "
+            "runtime stats and emitting real disagreement output. Default 2 "
+            "(small for tests; production likely 8+)."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
 
@@ -526,6 +550,8 @@ def main(argv: list[str] | None = None) -> int:
         prompt=args.prompt,
         threshold=args.threshold,
         num_tokens=args.num_tokens,
+        runtime_stats=not args.no_runtime_stats,
+        warmup=args.warmup,
         verbose=args.verbose,
     )
 
