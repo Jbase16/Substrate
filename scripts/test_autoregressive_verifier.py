@@ -161,7 +161,7 @@ def run_test(
     print()
 
     print("Building 3-tier plan (4bit -> 6bit -> fp16)...")
-    from scripts.test_weight_bank import build_test_plan, build_op_tier_precisions
+    from substrate.bench import build_test_plan, build_op_tier_precisions
     plan = build_test_plan(model_id, layers, {0: "4bit", 1: "6bit", 2: "fp16_eq"})
     precisions = build_op_tier_precisions(plan, {0: "4bit", 1: "6bit", 2: "fp16_eq"})
 

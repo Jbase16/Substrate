@@ -223,7 +223,7 @@ def run_test_cl1(model_id: str, prompt: str, verbose: bool) -> int:
     # The IR sorts these by precision; in build_test_plan's encoding,
     # tier 0 is 4-bit (lowest bits), tier 2 is fp16 (highest bits).
     print("Building 3-tier plan (4bit → 6bit → fp16)...")
-    from scripts.test_weight_bank import build_test_plan, build_op_tier_precisions
+    from substrate.bench import build_test_plan, build_op_tier_precisions
     plan = build_test_plan(
         model_id, layers,
         {0: "4bit", 1: "6bit", 2: "fp16_eq"},

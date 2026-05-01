@@ -161,7 +161,7 @@ def run_test_bc1(model_id: str, prompt: str, verbose: bool) -> int:
     # Two-tier plan: tier 0 = 4bit (default), tier 1 = fp16 (escalation).
     # The IR requires monotonically non-decreasing peak_ram_delta_bytes,
     # which is naturally satisfied because fp16 is more bits than 4bit.
-    from scripts.test_weight_bank import build_test_plan, build_op_tier_precisions
+    from substrate.bench import build_test_plan, build_op_tier_precisions
     plan = build_test_plan(model_id, layers_a, {0: "4bit", 1: "fp16_eq"})
     precisions = build_op_tier_precisions(plan, {0: "4bit", 1: "fp16_eq"})
 

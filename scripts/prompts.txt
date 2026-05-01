@@ -1,0 +1,64 @@
+# Benchmark prompts: 50 prompts spanning five categories.
+# Lines starting with '#' are comments and skipped by the harness.
+# Each non-comment, non-blank line is one prompt. Order is shuffled deterministically
+# at run time using a fixed seed so categories don't cluster runtime-stat patterns.
+
+# === Category 1: Technical / systems (10) ===
+Explain why SSD streaming is the bottleneck for local LLM inference.
+Describe the difference between attention and feed-forward layers in a transformer.
+What is KV cache and why does it matter for autoregressive generation?
+Explain how rotary position embeddings work in modern language models.
+Why does mixed-precision quantization preserve quality better than uniform quantization?
+What are the main differences between INT8 and FP8 in deep learning hardware?
+Explain how speculative decoding accelerates language model inference.
+Describe how memory bandwidth limits throughput on Apple Silicon Macs.
+What is the role of group_size in weight quantization schemes like GPTQ?
+Explain how flash attention reduces memory consumption during training.
+
+# === Category 2: Reasoning / step-by-step (10) ===
+A train leaves Boston at 3pm going 60 mph. Another leaves NYC at 4pm going 80 mph toward Boston. They are 220 miles apart. When do they meet?
+If a shirt is on sale for 30 percent off and then another 20 percent off the discounted price, what is the total discount from the original price?
+Sarah has three brothers. Each brother has two sisters. How many sisters does Sarah have?
+A bat and ball cost 1.10 together. The bat costs 1.00 more than the ball. How much does the ball cost?
+If it takes 5 machines 5 minutes to make 5 widgets, how long does it take 100 machines to make 100 widgets?
+List the steps to safely change a flat tire on the side of a highway.
+Explain how to debug a memory leak in a long-running Python process.
+Walk through how to set up a Postgres replica with streaming replication.
+Describe the steps to migrate a Django project from SQLite to Postgres.
+Explain why the halting problem is undecidable, in terms a programmer would find concrete.
+
+# === Category 3: Factual recall (10) ===
+What year did the Berlin Wall fall and why was that significant?
+Who wrote the novel Beloved and what is its central theme?
+What is the boiling point of water at sea level in Celsius and Fahrenheit?
+Name the planets of our solar system in order from the sun.
+What language is spoken in Brazil and why is it different from its neighbors?
+What is the largest desert in the world by area?
+Who painted the ceiling of the Sistine Chapel and approximately when?
+What is the chemical formula of caffeine and what does it do?
+Name three programming languages developed at Bell Labs.
+What were the main causes of the 1929 stock market crash?
+
+# === Category 4: Instruction following (10) ===
+Write a short Python function that returns the nth Fibonacci number using memoization.
+Write three sentences in the style of Hemingway about a fisherman watching the sunrise.
+Translate the following sentence into formal Spanish: I would like to make a reservation for two people at seven in the evening.
+Generate a JSON object with fields name, age, and favorite_color for a fictional 28-year-old illustrator named Mira.
+Write a haiku about a server room in winter.
+List five common causes of segmentation faults in C programs.
+Write a one-sentence elevator pitch for a startup that helps musicians collaborate remotely.
+Compose a short polite email declining a meeting invitation due to a schedule conflict.
+Generate a regex that matches valid email addresses with at most 64 characters in the local part.
+Write a SQL query to find the second-highest salary in an employees table without using LIMIT.
+
+# === Category 5: Casual / open-ended (10) ===
+Tell me something interesting you know about octopuses.
+What makes a really good cup of coffee in the morning?
+If you were planning a quiet weekend in San Francisco, what would you do?
+Why do people like to watch the same movies over and over?
+What is the best way to learn a new musical instrument as an adult?
+Describe a perfect afternoon for someone who loves both reading and hiking.
+What is one underrated kitchen tool that home cooks should own?
+Why do some songs get stuck in our heads more easily than others?
+What is the appeal of long-running television series compared to films?
+What is something most people misunderstand about introverts?
